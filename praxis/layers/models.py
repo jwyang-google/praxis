@@ -247,6 +247,18 @@ class LanguageModel(base_model.BaseModel):
         labels=predict_data.labels,
         causal_attention_mask=predict_data.causal_attention_mask,
         **predict_data.extra_input_kwargs)
+    # print("------------------------------")
+    # print(predict_data.inputs)
+    # print(predict_data.paddings)
+    # print(predict_data.labels)
+    # print(predict_data.causal_attention_mask)
+    # print(**predict_data.extra_input_kwargs)
+    # print(predictions)
+    # assert False
+    # input_example = predict_data.inputs[0, ]
+    # paddings = predict_data.paddings[0, ]
+    # logits_example = predictions.logits[0, 0, ]
+    # jax.debug.print("----------inputs: {x}, paddings: {y}, logits: {z}", x=input_example, y=paddings, z=logits_example)
 
     return predictions
 

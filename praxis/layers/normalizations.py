@@ -311,6 +311,7 @@ class LayerNorm(BaseNormalization):
   use_scale: bool = True
   use_bias: bool = True
   reductions_in_fp32: bool = False
+  # reductions_in_fp32: bool = True
 
   def setup(self) -> None:
     """Creates layer normalization variables."""
@@ -361,19 +362,34 @@ class LayerNorm(BaseNormalization):
       'inputs'.
     """
     del paddings  # Unused.
-    if self.reductions_in_fp32:
-      inputs_dtype = inputs.dtype
-      inputs = inputs.astype(jnp.float32)
-    mean = jnp.mean(inputs, axis=[-1], keepdims=True)
-    var = jnp.mean(jnp.square(inputs - mean), axis=[-1], keepdims=True)
-    normed_inputs = (inputs - mean) * jax.lax.rsqrt(var + self.epsilon)
-    if self.reductions_in_fp32:
-      normed_inputs = normed_inputs.astype(inputs_dtype)
+    # if self.reductions_in_fp32:
+    #   inputs_dtype = inputs.dtype
+    #   inputs = inputs.astype(jnp.float32)
+    # mean = jnp.mean(inputs, axis=[-1], keepdims=True)
+    # var = jnp.mean(jnp.square(inputs - mean), axis=[-1], keepdims=True)
+    # normed_inputs = (inputs - mean) * jax.lax.rsqrt(var + self.epsilon)
+    # if self.reductions_in_fp32:
+    #   normed_inputs = normed_inputs.astype(inputs_dtype)
+    # if self.use_scale:
+    #   normed_inputs *= (1 + self.theta.scale)
+    # if self.use_bias:
+    #   normed_inputs += self.theta.bias
+    # return normed_inputs
+  
+    # BLOOM-JAX implementation (why this would be different?)
+    x = jnp.asarray(inputs, jnp.float32)
+    features = inputs.shape[-1]
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    mean2 = jnp.mean(jax.lax.square(x), axis=-1, keepdims=True)
+    var = mean2 - jax.lax.square(mean)
+    mul = jax.lax.rsqrt(var + self.epsilon)
     if self.use_scale:
-      normed_inputs *= (1 + self.theta.scale)
+        mul = mul * jnp.asarray(self.theta.scale, self.dtype)
+    y = (x - mean) * mul
     if self.use_bias:
-      normed_inputs += self.theta.bias
-    return normed_inputs
+        y = y + jnp.asarray(self.theta.bias, self.dtype)
+    return jnp.asarray(y, self.dtype)
+
 
 
 class RmsNorm(BaseNormalization):

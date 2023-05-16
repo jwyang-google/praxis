@@ -232,6 +232,10 @@ class TransformerLm(base_layer.BaseLayer):
   position_emb_tpl: LayerTpl = template_field(
       embedding_softmax.PositionalEmbedding
   )
+
+  # add embedding layernorm
+  embedding_ln_tpl: LayerTpl = template_field(normalizations.LayerNorm)
+
   model_dims: int = 0
   stacked_transformer_tpl: LayerTpl = template_field(
       transformers.StackedTransformer
@@ -456,6 +460,11 @@ class TransformerLm(base_layer.BaseLayer):
     if self.ngrammer_tpl is not None:
       self.create_child('ngrammer', self.ngrammer_tpl)
 
+    # Embedding layernorm.
+    if self.embedding_ln_tpl is not None:
+      embedding_ln_params = self.embedding_ln_tpl.clone().set(dim=self.model_dims)
+      self.create_child('embedding_ln', embedding_ln_params)
+
     # Transformer layers.
     stacked_xformer_params = self.stacked_transformer_tpl.clone()
     xformer_params = stacked_xformer_params
@@ -597,10 +606,15 @@ class TransformerLm(base_layer.BaseLayer):
     if self.separate_embedding_tpl is not None:
       input_emb = self.embedding_lookup.emb_lookup(inputs)
     else:
+      # print("*********no separate embedding")
+      inputs = inputs.at[:].set(1.0)
       input_emb = self.softmax.emb_lookup(inputs)
+      # jax.debug.print("check embedding lookup----------inputs: {a}, shape: {b}, outputs: {x}, shape: {y}", 
+      #     a=inputs, b=inputs.shape, x=input_emb, y=input_emb.shape)
 
     # Add NGrammer to the source embeddings.
     if self.ngrammer_tpl is not None:
+      # print("********with ngrammer")
       if self.separate_embedding_tpl is not None:
         emb_var = self.embedding_lookup.theta.emb_var
       else:
@@ -612,12 +626,18 @@ class TransformerLm(base_layer.BaseLayer):
           segment_pos=segment_pos,
           emb_var=emb_var)
 
-    if self.position_emb_tpl is not None:
-      position_emb = self.position_emb(
-          seq_length=seq_length, position=segment_pos)
-      inputs = input_emb + position_emb
-    else:
-      inputs = input_emb
+    # if self.position_emb_tpl is not None:
+    #   print("********with position emb layer")
+    #   position_emb = self.position_emb(
+    #       seq_length=seq_length, position=segment_pos)
+    #   inputs = input_emb + position_emb
+    # else:
+    #   inputs = input_emb
+    inputs = input_emb
+    if self.embedding_ln_tpl is not None:
+      inputs = self.embedding_ln(inputs)
+      # jax.debug.print("check embedding layernorm----------outputs: {x}, shape: {y}", 
+      #     x=inputs, y=inputs.shape)
     return inputs
 
   def __call__(self,
@@ -662,6 +682,9 @@ class TransformerLm(base_layer.BaseLayer):
     """
     batch, seq_length = inputs.shape
 
+    # jax.debug.print("before embedding lookup----------inputs: {a}, shape: {b}, paddings: {c}, shape: {d}", 
+    #   a=inputs, b=inputs.shape, c=paddings, d=paddings.shape)
+
     paddings_float32 = paddings.astype(jnp.float32)
     num_unpadded_tokens = jnp.sum(1.0 - paddings_float32)
     self.add_summary('num_unpadded_tokens', num_unpadded_tokens)
@@ -689,12 +712,19 @@ class TransformerLm(base_layer.BaseLayer):
                                                       causal_attention_mask)
 
     self.update_decode_state('time_step', start_time_step)  # pytype: disable=wrong-arg-types  # jax-ndarray
+    
+    # jax.debug.print("check step 0----------inputs: {z}, shape: {a}", z=inputs, a=inputs.shape)
     output = self.transformer(
         inputs, paddings, segment_mask=segment_mask, segment_pos=segment_pos)
+    # output_example = jax.numpy.expand_dims(output[0, 0, ], 0)
+    # jax.debug.print("check step 3 after all attention layers----------output: {z}, shape: {a}", z=output, a=output.shape)
 
     # Final layer norm
     if self.final_ln_tpl is not None:
       output = self.final_ln(output)
+      # output_example = jax.numpy.expand_dims(output[0, 0, ], 0)
+      # jax.debug.print("check step 4 final layernorm----------output: {a}, shape: {b}", a=output, b=output.shape)
+
 
     if self.skip_compute_loss:
       return output
@@ -869,6 +899,10 @@ class TransformerLm(base_layer.BaseLayer):
     # [B, ?], [B, ?, D], [B, ?]
     input_ids, input_emb, segment_pos = self._emb_ngrammer(
         input_ids, input_emb, segment_pos)
+
+    # Embedding layernorm
+    if self.embedding_ln_tpl is not None:
+      input_emb = self.embedding_ln(input_emb)
 
     # [B, ?, D]
     transformer_inputs = self._add_pos_emb(input_emb, segment_pos)

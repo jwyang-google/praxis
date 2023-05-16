@@ -191,8 +191,14 @@ class FeedForward(base_layer.BaseLayer):
 
   def __call__(self, inputs: JTensor) -> JTensor:
     projected_inputs = self.linear(inputs)
+
     if self.has_bias:
       projected_inputs = self.bias(projected_inputs)
+      # if self.name == "ffn_layer1":
+      #   inputs_example = inputs[0, :]
+      #   projected_inputs_example = projected_inputs[0, :]
+      #   jax.debug.print("after fflayer1 dense---------inputs: {x}, shape: {y}, projected_inputs: {a}, shape: {b}", 
+      #                   x=inputs_example, y=inputs_example.shape, a=projected_inputs_example, b=projected_inputs_example.shape)
     output = self.activation(projected_inputs)
     return output
 

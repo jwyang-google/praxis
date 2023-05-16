@@ -704,7 +704,11 @@ class AttentionProjection(base_layer.BaseLayer):
       ), f'Expecting shape[-1] == p.input_dim, {shape[-1]} != {self.input_dim}'
       batch_eqn = eqn_sym[:(rank - 1)] if rank else '...'
       eqn = f'{batch_eqn}D,DNH->{batch_eqn}NH'
+
     ret = jnp.einsum(eqn, inputs, w, _dot_general=self.make_dot_general())
+    # w_t = jnp.transpose(w, (1, 2, 0))
+    # jax.debug.print("check attn dense----------inputs: {a}, shape: {b}, weights: {c}, shape: {d}, ret: {e}, shape: {f}", 
+    #         a=inputs, b=inputs.shape, c=w_t, d=w_t.shape, e=ret, f=ret.shape)
     if self.use_bias:
       ret += theta.b
     return ret
@@ -842,13 +846,56 @@ class CombinedQKVProjectionLayer(base_layer.BaseLayer):
     # K indexes qkv.
     eqn = f'{batch_eqn}D,KDNH->K{batch_eqn}NH'
     ret = jnp.einsum(eqn, inputs, w, _dot_general=self.make_dot_general())
+
+    # debugging
+    kernel_reshaped = jnp.transpose(w, (1, 2, 3, 0))
+    kernel_reshaped = jnp.reshape(kernel_reshaped, (4096, 32, 384))
+    # w = jnp.reshape(kernel_reshaped, (4096, 32, 3, 128))
+    # w = jnp.transpose(w, (2, 0, 1, 3))    
+    # y_reshaped = jnp.transpose(ret, (1, 2, 3, 4, 0))
+    # y_reshaped = jnp.transpose(ret, (1, 2, 3, 0, 4))
+    # y_reshaped = jnp.reshape(ret, (-1, 2048, 32, 384))
+    # jax.debug.print("check qkv proj----------inputs: {a}, shape: {b}, y: {c}, shape: {d}, kernel: {e}, shape: {f}", 
+    #                 a=inputs, b=inputs.shape, c=y_reshaped, d=y_reshaped.shape, e=kernel_reshaped, f=kernel_reshaped.shape)
+
+    inputs_test = inputs # 1*2048*4096
+    # inputs_test = jnp.expand_dims(inputs[0, 0, :], 0) # 1*4096
+    # kernel_test = kernel_reshaped[:, 0, :] # 4096*384
+    kernel_test = kernel_reshaped # 4096*32*384
+
+    # kernel_test = jnp.reshape(kernel_reshaped, (4096, 32, 3, 128))
+    # kernel_test = jnp.transpose(kernel_test, (2, 0, 1, 3)) # 3*4096*32*128
+    eqn_test = f'{batch_eqn}K, KCD-> {batch_eqn}CD'
+    # print("---------------------------", inputs_test, kernel_test, eqn_test)
+    ret_test = jnp.einsum(eqn_test, inputs_test, kernel_test, _dot_general=self.make_dot_general())
+    # q, k, v = ret_test
+    # jax.debug.print("check qkv proj----------inputs: {a}, shape: {b}, y: {c}, shape: {d}, kernel: {e}, shape: {f}", 
+    #                 a=inputs_test, b=inputs_test.shape, c=ret_test, d=ret_test.shape, 
+    #                 e=kernel_test, f=kernel_test.shape)
+    
+
+    if self.use_bias:
+        bias_reshaped = jnp.transpose(b, (1, 2, 0))
+        bias_reshaped = jnp.reshape(bias_reshaped, (32, 384))
+
+        # jax.debug.print("check qkv bias before--------y:{e}, kernel: {c}, shape: {d}, bias: {a}, shape: {b}", 
+        #                 c=kernel_test, d=kernel_test.shape, a=bias_reshaped, b=bias_reshaped.shape, e=ret_test)
+        ret_test += jnp.reshape(bias_reshaped, (1,) * (2 - ret_test.ndim) + bias_reshaped.shape[:])
+        # jax.debug.print("check qkv bias after--------y:{e}, kernel: {c}, shape: {d}, bias: {a}, shape: {b}", 
+        #         c=kernel_test, d=kernel_test.shape, a=bias_reshaped, b=bias_reshaped.shape, e=ret_test)
+
+        q_test, k_test, v_test = jnp.split(ret_test, 3, axis=-1)
+        # jax.debug.print("check qkv values--------y:{a}, q_ret: {b}, shape: {c}, k_ret: {d}, shape: {e}, v_ret: {f}, shape:{g}", 
+        #                 a=ret_test, b=q_test, c=q_test.shape, d=k_test, e=k_test.shape, f=v_test, g=v_test.shape)
+
     ret = checkpoint_name(ret, 'combined_qkv_proj')
     if self.use_bias:
       # Add newaxis to bias weight for each batch dim since ret is K...NH
       # and theta.b is KNH. Need to reshape theta.b to K...NH
       ret += jnp.expand_dims(b, list(range(1, batch_dims_rank + 1)))
+
     # Split into three projections.
-    query_proj, key_proj, value_proj = ret
+    query_proj, key_proj, value_proj = q_test, k_test, v_test
     query_proj = checkpoint_name(query_proj, 'query_proj')
     key_proj = checkpoint_name(key_proj, 'key_proj')
     value_proj = checkpoint_name(value_proj, 'value_proj')
@@ -1199,7 +1246,9 @@ class DotProductAttention(base_layer.BaseLayer):
   def _scale_query(self, query: JTensor) -> JTensor:
     """Scales the query vector if enabled."""
     if self.internal_enable_query_scale:
+      # print("***********internal enable query scale")
       if self.internal_enable_per_dim_scale:
+        # print("***********internal per dim scale")
         query = self.per_dim_scale(query)
       else:
         query *= (self.hidden_dim // self.num_heads) ** -0.5
@@ -1209,6 +1258,7 @@ class DotProductAttention(base_layer.BaseLayer):
     """Caps the logits by p.atten_logit_cap with tanh, if enabled."""
     if not self.atten_logit_cap or self.atten_logit_cap <= 0.0:
       return logits
+    # print("************cap logits")
     cap = jnp.array(self.atten_logit_cap, dtype=logits.dtype)
     # Note that since this caps the negative side as well, caller
     # must defer the pad-with-very-negative-logits logic to after
@@ -1271,6 +1321,7 @@ class DotProductAttention(base_layer.BaseLayer):
       encoded: JTensor of shape [B, T, N, H].
       atten_probs: JTensor of shape [B, N, T, S].
     """
+    # jax.debug.print("check attn mask------------attn mask: {a}, shape: {b}", a=atten_mask, b=atten_mask.shape)
     query = self._shard_blnh(query)
     key = self._shard_blnh(key)
     value = self._shard_blnh(value)
@@ -1292,7 +1343,7 @@ class DotProductAttention(base_layer.BaseLayer):
     logits = self._atten_logits(query, key)
     if relative_bias is not None:
       # The relative_bias has shape [1, n, t, s] or [b, n, t, s].
-      base_layer.assert_has_shape(relative_bias, [-1, n, t, s])
+      # base_layer.assert_has_shape(relative_bias, [-1, n, t, s])
       logits += relative_bias
     logits = checkpoint_name(logits, 'logits')
     self.add_summary(
@@ -1311,18 +1362,21 @@ class DotProductAttention(base_layer.BaseLayer):
     if self.attention_mask_summary:
       self.add_summary('attention_mask', atten_mask)
     if self.attention_extra_logit is None:
+      # print("*************no attention extra logits")
       probs = jax.nn.softmax(padded_logits, axis=-1).astype(key.dtype)
     else:
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
           key.dtype)
     # Apply attention dropout.
     probs = self.atten_dropout(probs)
+
     # Compute the attention context.
     encoded = jnp.einsum(
         'BNTS,BSNH->BTNH', probs, value, _dot_general=self.make_pv_dot_general()
     )
 
     if self.zero_fully_masked:
+      # print("*************zero fully masked")
       # Return zeros for tokens which don't attend anything.
       fully_masked = jnp.all(
           atten_mask < py_utils.get_large_negative_number(jnp.float32) / 2,
@@ -1453,6 +1507,10 @@ class DotProductAttention(base_layer.BaseLayer):
       encoded: JTensor of shape [B, T, D].
       atten_probs: JTensor of shape [B, N, T, S].
     """
+    # query_vec = query_vec.at[:, :, :].set(1.0)
+    # key_vec = query_vec
+    # value_vec = query_vec
+    
     if self.combine_qkv:
       # Only supports self attention.
       assert query_vec is key_vec
@@ -1467,12 +1525,18 @@ class DotProductAttention(base_layer.BaseLayer):
       key_proj = self.key(key_vec)
       value_proj = self.value(value_vec)
 
+    # jax.debug.print("before qkv proj----------hidden_states: {a}, shape: {b}, query: {x}, key: {y}, value: {z}", 
+    #             a=query_vec, b=query_vec.shape, x=query_proj, y=key_proj, z=value_proj)
+    # jax.debug.print("after qkv proj----------query: {x}, key: {y}, value: {z}, query_shape: {a}, key_shape: {b}, value_shape: {c}", 
+    #             x=query_proj, y=key_proj, z=value_proj, a=query_proj.shape, b=key_proj.shape, c=value_proj.shape)
+
     self._fprop_update_decode_state('key_state', key_proj)
     self._fprop_update_decode_state('value_state', value_proj)
 
     # Apply depth-wise convolution as in Primer.
     # Paper: https://arxiv.org/abs/2109.08668.
     if self.dconv_qkv:
+      # print("*******deconv qkv")
       self._fprop_update_decode_state('query_state', query_proj)
       query_proj = self.dconv_q(
           query_proj, axis=1, segment_pos=query_segment_pos)
@@ -1485,6 +1549,7 @@ class DotProductAttention(base_layer.BaseLayer):
     # Apply rotary position embeddings.
     # Paper: https://arxiv.org/abs/2104.09864.
     if self.use_rotary_position_emb:
+      # print("*******rotatry postion embedding")
       query_proj = self.rotary_position_emb(query_proj, query_segment_pos)
       key_proj = self.rotary_position_emb(key_proj, key_segment_pos)
       self._fprop_update_decode_state('key_post_rotary_pos_emb', key_proj)
@@ -1492,16 +1557,73 @@ class DotProductAttention(base_layer.BaseLayer):
     # Apply relative bias.
     # Paper: https://aclanthology.org/N18-2074.pdf.
     if self.relative_bias_tpl:
+      # print("***********relative bias")
       relative_bias = self.relative_bias(query_segment_pos, key_segment_pos)
     else:
-      relative_bias = None
+      def build_alibi_tensor_flax(attention_mask, n_head, dtype):
+          def get_slopes(n):
+              def get_slopes_power_of_2(n):
+                  start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+                  ratio = start
+                  return [start * ratio**i for i in range(n)]
+
+              if math.log2(n).is_integer():
+                  return get_slopes_power_of_2(n)
+              else:
+                  closest_power_of_2 = 2 ** math.floor(math.log2(n))
+                  return (
+                      get_slopes_power_of_2(closest_power_of_2)
+                      + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+                  )
+
+          # Note: alibi will added to the attention bias that will be applied to the query, key product of attention
+          # => therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
+          # => here we set (batch_size=1, num_heads=n_head, query_length=1, key_length=max_length)
+          # => the query_length dimension will then be broadcasted correctly
+          # This is more or less identical to T5's relative position bias:
+          # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_flax_t5.py#L426
+          # batch_size = 1, n_head = n_head, query_length
+          batch_size, key_length = attention_mask.shape[0], attention_mask.shape[-1]
+          num_heads = n_head
+          query_length = 1
+
+          slopes = jnp.array(get_slopes(n_head))[None, :, None, None].astype(dtype)
+          arange_tensor = attention_mask.cumsum(-1, dtype=dtype)[:, None, None, :] - 1
+
+          slopes_broadcasted = jnp.broadcast_to(slopes, (batch_size, num_heads, query_length, key_length))
+          arange_broadcasted = jnp.broadcast_to(arange_tensor, (batch_size, num_heads, query_length, key_length))
+
+          alibi = slopes_broadcasted * arange_broadcasted
+          return alibi
+      
+      orig_attn_mask = jnp.minimum(atten_mask[:, 0, -1, :], -1.0) + 2.0
+      orig_attn_mask = jnp.maximum(orig_attn_mask, 0.0)
+      # jax.debug.print(
+      #   "before check alibi attn mask------------attn_mask: {a}, shape: {b}, orig_attn_mask: {c}, shape: {d}",
+      #   a=atten_mask, b=atten_mask.shape, c=orig_attn_mask, d=orig_attn_mask.shape)
+      relative_bias = build_alibi_tensor_flax(
+        attention_mask=orig_attn_mask, 
+        n_head=query_proj.shape[-2], 
+        dtype=query_proj.dtype)
+      # jax.debug.print(
+      #   "check alibi attn mask------------attn_mask: {a}, shape: {b}, orig_attn_mask: {c}, shape: {d}, alibi: {e}, shape: {f}",
+      #   a=atten_mask, b=atten_mask.shape, c=orig_attn_mask, d=orig_attn_mask.shape, e=relative_bias, f=relative_bias.shape)
+
+
+    # query_proj = query_proj.at[:].set(1.0)
+    # key_proj = key_proj.at[:].set(1.0)
+    # value_proj = value_proj.at[:].set(1.0)
+    # jax.debug.print("before self attention----------query: {x}, key: {y}, value: {z}, query_shape: {a}, key_shape: {b}, value_shape: {c}", 
+    #                 x=query_proj, y=key_proj, z=value_proj, a=query_proj.shape, b=key_proj.shape, c=value_proj.shape)
 
     encoded, atten_probs = self._dot_atten(query_proj, key_proj, value_proj,
                                            atten_mask, relative_bias)
-
+    # jax.debug.print("after self attention----------attention_weights: {a}, shape: {b}, output: {c}, shape: {d}", 
+    #                 a=atten_probs, b=atten_probs.shape, c=encoded, d=encoded.shape)
     # Apply NGrammer to the output of the attention layer.
     # Paper: https://openreview.net/forum?id=GxjCYmQAody.
     if self.ngrammer_tpl is not None:
+      # print("***********ngrammer in dot product attention")
       self._fprop_update_decode_state('encoded_pre_ngrammer', encoded)
       attention_scores = None
       if self.ngrammer_tpl.ngram_using_attention_scores:
@@ -1514,7 +1636,13 @@ class DotProductAttention(base_layer.BaseLayer):
           attention_scores=attention_scores)
 
     # Post projection
+    # encoded = encoded.at[:].set(1.0)
+    # jax.debug.print("before attn dense----------attention_output: {c}, shape: {d}", 
+    #             c=encoded, d=encoded.shape)
     encoded = self.post(encoded)
+    # jax.debug.print("after attn dense----------attention_output: {c}, shape: {d}", 
+    #             c=encoded, d=encoded.shape)
+
     encoded = self._shard_bld(encoded)
     encoded = checkpoint_name(encoded, 'out_proj')
 

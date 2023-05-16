@@ -353,7 +353,8 @@ class TransformerFeedForward(base_layer.BaseLayer):
       activation = pax_fiddle.Config(activations_lib.Identity)
       gate_activation = self.activation_tpl.clone()
     else:
-      activation = self.activation_tpl.clone()
+      # activation = self.activation_tpl.clone()
+      activation = pax_fiddle.Config(activations_lib.BLOOM_GELU)
       gate_activation = None
 
     # Create the first Feedforward layer mapping to hidden dims
@@ -424,47 +425,62 @@ class TransformerFeedForward(base_layer.BaseLayer):
                segment_ids: Optional[JTensor] = None) -> JTensor:
     # Expand paddings to last dim if not None to have shape [batch, time, 1]
     if paddings is not None:
+      # print("*********expand padding")
       paddings = jnp.expand_dims(paddings, axis=-1)
 
     if self.apply_padding_first and paddings is not None:
+      # print("*********apply padding first")
       inputs *= (1.0 - paddings)
 
     self.add_summary('input_rms', _rms(inputs), verbosity=4)
+    # inputs = inputs.at[:].set(1.0)
     residual = inputs
 
     if self.norm_policy == 'primer_hybrid':
       inputs = self.pre_layer_norm(inputs)
     elif self.norm_policy == 'pre':
+      # jax.debug.print("before input layernorm----------inputs: {x}, shape: {y}", 
+      #           x=inputs, y=inputs.shape)
       inputs = self.layer_norm(inputs)
+      # jax.debug.print("after input layernorm----------outputs: {x}, shape: {y}", 
+      #           x=inputs, y=inputs.shape)
 
     if self.norm_policy in ('primer_hybrid', 'pre'):
       self.add_summary('input_norm_rms', _rms(inputs), verbosity=4)
 
     # Apply first FFN layer
     if self._is_ffn1_gated:
+      # print("***********gated fflayer1")
       # theta.ffn_layer1_gate corresponds to gshard_builder's wi0
       gate_value = self.ffn_layer1_gate(inputs)
       # theta.ffn_layer1 corresponds to gshard_builder's wi1
-      activations = gate_value * self.ffn_layer1(inputs)
+      activations = gate_value * self.ffn_layer1(inputs) 
     else:
       activations = self.ffn_layer1(inputs)
       activations = checkpoint_name(activations, 'ffn1')
 
+    # jax.debug.print("after fflayer1---------inputs: {x}, shape: {y}, activations: {a}, shape: {b}", 
+    #       x=inputs, y=inputs.shape, a=activations, b=activations.shape)
+
     # Apply paddings if not None
     if not self.apply_padding_first and paddings is not None:
+      # print("*********apply padding after fflayer1")
       activations *= (1.0 - paddings)
 
     self.add_summary('activation_rms', _rms(activations), verbosity=4)
 
     # Apply RELU dropout
-    activations = self.relu_dropout(activations)
+    # activations = self.relu_dropout(activations)
 
     # Apply second FFN layer
     outputs = self.ffn_layer2(activations)
     outputs = checkpoint_name(outputs, 'ffn2')
+    # jax.debug.print("after fflayer2---------inputs: {x}, shape: {y}, outputs: {a}, shape: {b}", 
+    #       x=activations, y=activations.shape, a=outputs, b=outputs.shape)
 
     # Apply paddings if not None
     if not self.apply_padding_first and paddings is not None:
+      # print("*********apply padding after fflayer2")
       outputs *= (1.0 - paddings)
 
     self.add_summary('output_rms', _rms(outputs), verbosity=4)
@@ -479,14 +495,18 @@ class TransformerFeedForward(base_layer.BaseLayer):
       self.add_summary('output_norm_rms', _rms(outputs), verbosity=4)
 
     # Apply residual dropout
-    outputs = self.residual_dropout(outputs)
+    # outputs = self.residual_dropout(outputs)
 
     # Apply skip connection
     if self.add_skip_connection:
+      # print("***************mlp skip connection with residual weight: {}".format(self.residual_weight))
       if self.residual_droppath_prob:
+        # print("**************residual droppath")
         outputs = self.residual_droppath(residual, outputs)
       else:
         outputs = residual + outputs * self.residual_weight
+    # jax.debug.print("after mlp residual---------outputs: {a}, shape: {b}", 
+    #    a=outputs, b=outputs.shape)
 
     # Cosine similarity between inputs (residual) and outputs.
     self.add_summary('output_rel_cos', _rel_cos(residual, outputs), verbosity=4)
@@ -1297,6 +1317,7 @@ class Transformer(base_layer.BaseLayer):
       The fflayer output with shape [B, T, D].
       atten_probs: A NestedMap with keys `self_atten` <float>[B, N, T, T].
     """
+    debug = False
 
     inputs_stats = stats.compute_stats(inputs, jnp.expand_dims(paddings, -1))
     self.add_summary('xformer_input_mean', inputs_stats.mean_v, verbosity=3)
@@ -1309,9 +1330,14 @@ class Transformer(base_layer.BaseLayer):
       inputs_normalized = self.pre_layer_norm(inputs)
     elif self.norm_policy == 'pre':
       inputs_normalized = self.layer_norm(inputs)
+      if debug:
+        # input_example = jax.numpy.expand_dims(inputs[0, 0, ], 0)
+        # input_normalized_example = jax.numpy.expand_dims(inputs_normalized[0, 0, ], 0)
+        jax.debug.print("check step 2-1 input layernorm----------inputs: {x}, outputs: {y}", 
+                        x=inputs, y=inputs_normalized)
     else:
       inputs_normalized = inputs
-
+    
     # Compute self-attention, key/value vectors are the input itself
     atten_output, self_atten_probs = self.self_attention(
         inputs_normalized,
@@ -1321,6 +1347,11 @@ class Transformer(base_layer.BaseLayer):
         query_segment_pos=segment_pos,
         key_segment_pos=segment_pos)
     atten_probs = NestedMap(self_atten=self_atten_probs)
+    if debug:
+      # input_normalized_example = jax.numpy.expand_dims(inputs_normalized[0, 0, ], 0)
+      # atten_output_example = jax.numpy.expand_dims(atten_output[0, 0, ], 0)
+      jax.debug.print("check step 2-2 attention block----------inputs: {a}, shape: {b}, outputs: {c}, shape: {d}, attention_weights: {e}, shape: {f}", 
+                  a=inputs_normalized, b=inputs_normalized.shape, c=atten_output, d=atten_output.shape, e=self_atten_probs, f=self_atten_probs.shape)
 
     self.add_summary('attention_output_rms', _rms(atten_output), verbosity=4)
 
@@ -1334,12 +1365,19 @@ class Transformer(base_layer.BaseLayer):
 
     # Residual dropout and connection
     atten_output = self.residual_dropout(atten_output)
+    if debug:
+      jax.debug.print("check step 2-3 residual dropout--------atten_output: {a}, shape: {b}",
+                      a=atten_output, b=atten_output.shape)
 
     # Apply skip connection
     if self.residual_droppath_prob > 0.0:
+      # print("***************residulal_droppath")
       atten_output = self.residual_droppath(inputs, atten_output)
     else:
       atten_output += inputs
+      if debug:
+        jax.debug.print("check step 2-4 attention skip connection------------atten_output: {a}, shape: {b}",
+                        a=atten_output, b=atten_output.shape)
 
     self.add_summary('attention_output_rel_cos', _rel_cos(inputs, atten_output),
                      verbosity=4)
@@ -1348,6 +1386,7 @@ class Transformer(base_layer.BaseLayer):
     if self.use_cross_attention and (
         not self.allow_skip_cross_attention or cross_inputs is not None
     ):
+      # print("***********with cross attention")
       assert cross_inputs is not None
       assert cross_attention_mask is not None
       if self.norm_policy == 'pre':
@@ -1378,7 +1417,11 @@ class Transformer(base_layer.BaseLayer):
         atten_output += cross_atten_output
 
     # Apply FFN layer
+    # atten_output = atten_output.at[:].set(1.0)
     output = self.ff_layer(atten_output, paddings=paddings)
+    if debug:
+      jax.debug.print("check step 2-5 mlp----------------output: {a}, shape: {b}",
+                      a=output, b=output.shape)
     return output, atten_probs  # pytype: disable=bad-return-type  # jax-ndarray
 
   def extend_step(self,
@@ -1703,6 +1746,8 @@ class StackedTransformer(base_layer.BaseLayer):
         cross_segment_mask,
         fold_padding_with_segment_mask=self.fold_padding_with_segment_mask,
     )
+    # jax.debug.print("check step 1------------------attention mask: {a}, shape: {b}",
+    #                 a=attention_mask, b=attention_mask.shape)
 
     x_out = inputs
     if self.input_dropout_prob > 0.0:
@@ -1717,6 +1762,8 @@ class StackedTransformer(base_layer.BaseLayer):
           cross_inputs,
           cross_attention_mask,
           segment_pos=segment_pos)
+      # jax.debug.print("check step 2 block layer {a}-------------input: {b}, shape: {c}, output: {d}, shape: {e}",
+      #           a=i, b=x_in, c=x_in.shape, d=x_out, e=x_out.shape)
       x_out = checkpoint_name(x_out, 'transformer_layer_out')
     return x_out
 

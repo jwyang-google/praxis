@@ -176,3 +176,7 @@ class Identity(BaseActivation):
   def __call__(self, inputs: JTensor) -> JTensor:
     """Applies the activation function."""
     return inputs
+
+class BLOOM_GELU(BaseActivation):
+      def __call__(self, inputs: JTensor) -> JTensor:
+        return inputs * 0.5 * (1.0 + jnp.tanh(0.79788456 * inputs * (1 + 0.044715 * inputs * inputs)))

@@ -1439,7 +1439,8 @@ class BaseLayer(nn.Module):
 
     out: SplitDimsMapping = None
 
-  dtype: jnp.dtype = jnp.float32
+  # dtype: jnp.dtype = jnp.float32
+  dtype: jnp.dtype = jnp.bfloat16
   fprop_dtype: Optional[Any] = None
   params_init: WeightInit = instance_field(default_param_init)
   skip_lp_regularization: Optional[bool] = None
